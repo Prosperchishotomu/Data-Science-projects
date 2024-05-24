@@ -1,0 +1,171 @@
+import cv2
+import numpy as np
+import mysql.connector
+import easyocr
+from twilio.rest import Client
+
+# Twilio account credentials
+account_sid = '##########'
+auth_token = '#########'
+twilio_phone_number = '+#########'
+
+# Load Haar Cascade XML for number plate detection
+plate_cascade = cv2.CascadeClassifier('C:/Users/HP/Downloads/cars.xml')
+
+# Create an EasyOCR reader
+reader = easyocr.Reader(['en'])
+
+# Open a connection to the MySQL database
+db = mysql.connector.connect(
+    host="localhost",
+    user="######",
+    password="######",
+    database="######"
+)
+cursor = db.cursor()
+
+# Create the 'plates' table if it doesn't exist
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS table1 (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        registration VARCHAR(255)
+    );
+''')
+
+# Twilio client
+client = Client(account_sid, auth_token)
+
+# Open the default camera
+cap = cv2.VideoCapture(0)
+
+# Create a separate frame for OCR results
+ocr_frame = np.zeros((500, 500, 3), np.uint8)
+
+while True:
+    # Read a frame from the camera
+    ret, frame = cap.read()
+
+    # Convert the frame to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect number plates in the frame
+    plates = plate_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+
+    # Loop through the detected plates
+    for (x, y, w, h) in plates:
+        # Draw a green rectangle around the detected plate
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+
+        # Extract the plate region
+        plate_region = gray[y:y + h, x:x + w]
+
+        # Display a message to the user
+        cv2.putText(frame, "Press 's' to capture plate position", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        # Check for the 's' key to capture the plate position
+        if cv2.waitKey(1) & 0xFF == ord('s'):
+            # Hold the camera until OCR is finished
+            cap.release()
+
+            # Perform OCR on the plate region
+            text = reader.readtext(plate_region)
+
+            # Refresh the OCR frame
+            ocr_frame.fill(0)
+
+            # Display the extracted text on the OCR frame
+            cv2.putText(ocr_frame, text[0][1].replace(" ", ""), (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # Save the extracted text to the database
+            cursor.execute("INSERT INTO table1 (registration) VALUES (%s)", (text[0][1].replace(" ", ""),))
+            db.commit()
+
+            # Display a message reporting the results of OCR
+            print("OCR Results:", text[0][1].replace(" ", ""))
+
+            # Compare the OCR results with the contents of the vehicle_info table
+            cursor.execute("SELECT * FROM vehicle_info WHERE number_plates = %s", (text[0][1].replace(" ", ""),))
+            results = cursor.fetchall()
+
+            if results:
+                #Car is registered
+                print("Car is registered")
+                row = results[0]
+                phone_number = row[6]  # Assuming phone_number is in the third column
+                vehi_class = row[1]  # Assuming vehicle_class is in the fifth column
+                account_balance = row[5]  # Assuming account_balance is in the sixth column
+
+                # Calculate the toll fee based on vehicle class
+                if vehi_class == 'small':
+                    toll_fee = 10
+                elif vehi_class == 'medium':
+                    toll_fee = 20
+                elif vehi_class == 'bus':
+                    toll_fee = 30
+                else:
+                    toll_fee = 0
+
+                # Check if the account balance is sufficient
+                if account_balance >= toll_fee:
+                    # Verify the corresponding number using Twilio
+                    try:
+                        client.messages.create(
+                            body="Please enter the verification code sent to your phone number.",
+                            from_=twilio_phone_number,
+                            to=phone_number
+                        )
+                        print("Verification code sent to", phone_number)
+
+                        # Wait for the user to enter the verification code
+                        verification_code = input("Enter the verification code: ")
+
+                        # Check if the verification code is correct
+                        if verification_code == '1234':
+                            # Deduct the toll fee from the account balance
+                            new_balance = account_balance - toll_fee
+                            cursor.execute("UPDATE vehicle_info SET account_balance = %s WHERE number_plates = %s", (new_balance, text[0][1].replace(" ", ""),))
+                            db.commit()
+
+                            # Send a transaction notification
+                            try:
+                                client.messages.create(
+                                    body=f"Toll payment successful! Your new balance is {new_balance} for vehicle {text[0][1].replace(' ', '')} with class {vehi_class}.",
+                                    from_=twilio_phone_number,
+                                    to=phone_number
+                                )
+
+                                print("Transaction notification sent to", phone_number)
+                            except Exception as e:
+                                print("Error sending transaction notification:", e)
+
+                        else:
+                            # Display a message reporting incorrect verification code
+                            print("Incorrect verificationcode! Please try again.")
+
+                    except Exception as e:
+                        print("Error sending verification code:", e)
+
+                else:
+                    # Display a message reporting insufficient account balance
+                    print("Insufficient account balance! Please recharge your account.")
+
+            else:
+                # Car is not registered
+                print("Car is not registered")
+
+            # Re-initialize the camera
+            cap = cv2.VideoCapture(0)
+
+    # Display the current frame
+    cv2.imshow('frame', frame)
+    cv2.imshow('ocr_results', ocr_frame)
+
+    # Break the loop if the 'q' key is pressed
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Release the camera and close the windows
+cap.release()
+cv2.destroyAllWindows()
+cursor.close()
+db.close()
